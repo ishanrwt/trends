@@ -10,7 +10,16 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+         	"kv_namespaces": [ { "binding": "TREND_STATE", "id": "3f6c5f4089d240658e86d7ca027fd56d" } ],
+	"triggers": {
+		"crons": ["*/8 * * * *", "*/15 * * * *"]
+	},
+	"vars": {
+		"TELEGRAM_CHAT_ID": "1384923780"
+	}
+
+
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
