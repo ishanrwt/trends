@@ -8,18 +8,25 @@ const CYCLE_LOG_CAP = 400;           // per-day cycle log entries (a full day is
 const MOMENTUM_WINDOWS = ["m5", "h1", "h6"];
 const MAX_MOMENTUM_CHECKS = 8;
 const MIN_LIQUIDITY_USD = 10000;     // minimum liquidity for any token alert, from either source
+// Fresh tokens only, for both sources. Age is measured from the token's earliest DexScreener pair (pairCreatedAt),
+// the closest available signal for when it started trading. A token with no known launch time is NOT fresh.
+const MAX_TOKEN_AGE_HOURS = 2;
 const CG_MONTHLY_CAP = 9800;         // max CoinGecko calls per UTC month (free plan allows 10,000)
-const CG_MAX_POOL_AGE_HOURS = 24;    // CoinGecko trending pools older than this are ignored
 const CG_COUNTER_TTL_SECONDS = 40 * 24 * 60 * 60; // monthly call counter outlives its month by about 10 days
 // Counters added after launch; older days' stats don't contain them, so reports default them to 0.
 const LATE_COUNTER_DEFAULTS = {
   token_momentum_fail: 0,
+  token_too_old: 0,
   cg_ok: 0,
   cg_fail: 0,
   cg_skipped_cap: 0,
   cg_pools_seen: 0,
   cg_passed: 0,
-  cg_alerts: 0
+  cg_alerts: 0,
+  cg_dex_confirmed: 0,
+  cg_dex_rejected: 0,
+  cg_dex_nopair: 0,
+  cg_dex_unavailable: 0
 };
 
 export default {
@@ -52,6 +59,7 @@ export default {
         {
           scrapedoDailyCap: SCRAPEDO_DAILY_CAP,
           scrapingantDailyCap: SCRAPINGANT_DAILY_CAP,
+          maxTokenAgeHours: MAX_TOKEN_AGE_HOURS,
           coingecko: { month: cgMonth, callsThisMonth: await getCgMonthCount(env, cgMonth), monthlyCap: CG_MONTHLY_CAP },
           days
         },
@@ -338,12 +346,17 @@ function emptyStats() {
     scrapingant_fail: 0,
     scrapingant_skipped_cap: 0, // times the fallback was needed but the daily cap was reached
     token_momentum_fail: 0,
+    token_too_old: 0,     // tokens dropped (either source) for being older than MAX_TOKEN_AGE_HOURS or having no known launch time
     cg_ok: 0,
     cg_fail: 0,
     cg_skipped_cap: 0,    // times the CoinGecko call was skipped because the monthly cap was reached
     cg_pools_seen: 0,
-    cg_passed: 0,
-    cg_alerts: 0,
+    cg_passed: 0,         // trending pools that passed the CoinGecko-side filters
+    cg_alerts: 0,         // CoinGecko-sourced alerts actually sent
+    cg_dex_confirmed: 0,  // candidates whose DexScreener pair was also green
+    cg_dex_rejected: 0,   // candidates rejected by DexScreener liquidity/momentum
+    cg_dex_nopair: 0,     // candidates with no DexScreener pair where the token is the base token
+    cg_dex_unavailable: 0, // runs where the DexScreener confirmation lookup failed entirely
     alerts: 0
   };
 }
@@ -494,6 +507,10 @@ function buildDayReport(day, stats, cgUsage = null) {
     // Cycles where none of the listed tokens had been seen before: the feed fully turned over
     // since the previous successful check, so tokens may have been missed in between.
     possibleMissedWindows: log.filter(c => c.overlap === 0).map(c => c.t),
+    freshness: {
+      maxTokenAgeHours: MAX_TOKEN_AGE_HOURS,
+      tokensTooOld: counters.token_too_old
+    },
     routeUse,
     scrapedo: {
       creditsUsed: counters.scrapedo_ok || 0,
@@ -514,6 +531,10 @@ function buildDayReport(day, stats, cgUsage = null) {
       timesSkippedForCap: counters.cg_skipped_cap,
       poolsSeen: counters.cg_pools_seen,
       passedFilters: counters.cg_passed,
+      dexConfirmed: counters.cg_dex_confirmed,
+      dexRejected: counters.cg_dex_rejected,
+      dexNoPair: counters.cg_dex_nopair,
+      dexUnavailable: counters.cg_dex_unavailable,
       alerts: counters.cg_alerts
     },
     alerts: {
@@ -649,6 +670,27 @@ function formatMomentum(pair) {
   }).join(" | ");
 }
 
+// Fresh = launched within MAX_TOKEN_AGE_HOURS. Unknown launch time (null/NaN) is never fresh.
+function tokenAgeMs(launchMs, now) {
+  return Number.isFinite(launchMs) && launchMs > 0 ? Math.max(0, now - launchMs) : null;
+}
+
+function isFreshToken(launchMs, now) {
+  const ageMs = tokenAgeMs(launchMs, now);
+  return ageMs !== null && ageMs <= MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000;
+}
+
+function describeTokenAge(launchMs, now) {
+  const ageMs = tokenAgeMs(launchMs, now);
+  return ageMs === null ? "launch time unknown" : `${(ageMs / 3600000).toFixed(1)}h old`;
+}
+
+// "47m" under an hour, "1h 32m" from an hour up.
+function formatAge(ageMs) {
+  const minutes = Math.floor(Math.max(0, ageMs) / 60000);
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 async function savePending(env, key, pending) {
   await env.TREND_STATE.put(key, JSON.stringify(pending), {
     metadata: { status: "pending", discoveredAt: pending.discoveredAt }
@@ -729,7 +771,7 @@ async function evaluatePendingTokens(env, run) {
           const addr = side.address.toLowerCase();
           if (!asked.has(addr)) continue;
 
-          const entry = market.get(addr) || { liquidity: 0, volume24h: 0, name: null, symbol: null, pairCreatedAt: null, pair: null };
+          const entry = market.get(addr) || { liquidity: 0, volume24h: 0, name: null, symbol: null, pairCreatedAt: null, baseCreatedAt: null, pair: null };
           const pairLiquidity = pair.liquidity?.usd || 0;
           if (pairLiquidity >= entry.liquidity) entry.pair = pair;
           entry.liquidity = Math.max(entry.liquidity, pairLiquidity);
@@ -740,6 +782,10 @@ async function evaluatePendingTokens(env, run) {
           }
           if (pair.pairCreatedAt && (!entry.pairCreatedAt || pair.pairCreatedAt < entry.pairCreatedAt)) {
             entry.pairCreatedAt = pair.pairCreatedAt;
+          }
+          // Launch time for the freshness rule: earliest pair where this token is the BASE token.
+          if (side === pair.baseToken && pair.pairCreatedAt && (!entry.baseCreatedAt || pair.pairCreatedAt < entry.baseCreatedAt)) {
+            entry.baseCreatedAt = pair.pairCreatedAt;
           }
           market.set(addr, entry);
         }
@@ -784,7 +830,17 @@ async function evaluatePendingTokens(env, run) {
       continue;
     }
 
-    // Case C: full data available
+    // Case C: full data available.
+    // Freshness comes first and is checked on every evaluation, including momentum rechecks. Age only grows,
+    // so a token that is too old (or has no known launch time) is dropped for good.
+    const launchMs = info.baseCreatedAt || info.pairCreatedAt;
+    if (!isFreshToken(launchMs, Date.now())) {
+      run.stats.token_too_old++;
+      console.log(`[discoverTokens] "${displayName}" — too old (${describeTokenAge(launchMs, Date.now())}, max ${MAX_TOKEN_AGE_HOURS}h), dropped`);
+      await env.TREND_STATE.delete(key);
+      continue;
+    }
+
     const hasRealLiquidity = info.liquidity >= MIN_LIQUIDITY_USD;
 
     if (!hasRealLiquidity) {
@@ -822,7 +878,7 @@ async function evaluatePendingTokens(env, run) {
     if (isAnimal) reasons.push("animal-themed");
     await recordTokenAlert(env, run, pending, {
       displayName, name, symbol, url: pending.profileUrl || `https://dexscreener.com/${pending.chain}/${pending.tokenAddress}`,
-      isAnimal, liquidity: info.liquidity, volume24h: info.volume24h, reasons, pairCreatedAt: info.pairCreatedAt, pair: info.pair
+      isAnimal, liquidity: info.liquidity, volume24h: info.volume24h, reasons, pairCreatedAt: launchMs, pair: info.pair
     });
     alertCount++;
 
@@ -889,11 +945,39 @@ function parseCgPools(body) {
 // Returns why a CoinGecko pool doesn't qualify, or null if it does.
 function cgPoolRejection(pool, now) {
   const ageMs = now - pool.createdAtMs;
-  if (!Number.isFinite(ageMs) || ageMs > CG_MAX_POOL_AGE_HOURS * 60 * 60 * 1000) return "pool too old or undated";
+  if (!Number.isFinite(ageMs) || ageMs > MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000) return "pool too old or undated";
   if (!(pool.reserveUsd >= MIN_LIQUIDITY_USD)) return "liquidity below minimum";
   const momentum = passesMomentum({ priceChange: pool.priceChange });
   if (!momentum.ok) return `momentum failed: ${momentum.failed.join(", ")}`;
   return null;
+}
+
+// The DexScreener pair to check for a CoinGecko pool: the same pool address if DexScreener returned it,
+// otherwise the highest-liquidity pair. Only pairs where the token is the BASE token are considered.
+function pickDexPair(pairs, pool) {
+  const basePairs = pairs.filter(p => p?.baseToken?.address === pool.address);
+  const samePool = basePairs.find(p => p.pairAddress === pool.poolAddress);
+  if (samePool) return samePool;
+  let best = null;
+  for (const p of basePairs) {
+    if (!best || (p.liquidity?.usd || 0) > (best.liquidity?.usd || 0)) best = p;
+  }
+  return best;
+}
+
+// Earliest pairCreatedAt among DexScreener pairs where the token is the BASE token; null if none has one.
+function earliestBasePairCreatedAt(pairs, address) {
+  let earliest = null;
+  for (const p of pairs) {
+    if (p?.baseToken?.address !== address) continue;
+    const t = p.pairCreatedAt;
+    if (Number.isFinite(t) && t > 0 && (earliest === null || t < earliest)) earliest = t;
+  }
+  return earliest;
+}
+
+function describeChanges(priceChange) {
+  return MOMENTUM_WINDOWS.map(w => `${w}=${Number.isFinite(priceChange?.[w]) ? priceChange[w] : "n/a"}`).join(" ");
 }
 
 async function discoverTrendingCG(env, run) {
@@ -946,44 +1030,86 @@ async function discoverTrendingCG(env, run) {
   stats.cg_pools_seen += body.data.length;
 
   const now = Date.now();
-  let passed = 0;
-  let alerted = 0;
+  const candidates = [];
   for (const pool of parseCgPools(body)) {
     if (cgPoolRejection(pool, now)) continue;
     if (await env.TREND_STATE.get(`candidate:TOKEN:${pool.address}`)) continue; // already alerted
-    passed++;
+    candidates.push(pool);
+  }
+  stats.cg_passed += candidates.length;
+  cycle.cgPools = body.data.length;
+  cycle.cgPassed = candidates.length;
 
+  // CoinGecko's free data can be up to 60s old and computes price change differently from DexScreener,
+  // so a candidate only alerts if the DexScreener pair behind the alert link is also green.
+  // One batched lookup covers all candidates (CoinGecko returns at most 20 pools, DexScreener allows 30 addresses).
+  const confirmed = [];
+  if (candidates.length > 0) {
+    const result = await fetchDexJson(`https://api.dexscreener.com/tokens/v1/solana/${candidates.map(p => p.address).join(",")}`, env, run);
+    if (!result.success) {
+      stats.cg_dex_unavailable++;
+      cycle.cgDex = "unavailable";
+      console.log(`[cg] DexScreener lookup failed for ${candidates.length} candidates — no CoinGecko alerts this run`);
+    } else {
+      const pairs = Array.isArray(result.data) ? result.data : (result.data?.pairs || []);
+      for (const pool of candidates) {
+        const displayName = buildDisplayName(pool.name, pool.symbol, { description: "", tokenAddress: pool.address });
+        const pair = pickDexPair(pairs, pool);
+        if (!pair) {
+          stats.cg_dex_nopair++;
+          console.log(`[cg] "${displayName}" — no DexScreener pair with this token as base token, skipped`);
+          continue;
+        }
+        // The pool may be new while the token is not (a fresh pool for an old token), so check the token's earliest pair.
+        const launchMs = earliestBasePairCreatedAt(pairs, pool.address);
+        if (!isFreshToken(launchMs, now)) {
+          stats.token_too_old++;
+          console.log(`[cg] "${displayName}" — token too old (${describeTokenAge(launchMs, now)}, max ${MAX_TOKEN_AGE_HOURS}h), skipped`);
+          continue;
+        }
+        const dexLiquidity = pair.liquidity?.usd || 0;
+        if (!(dexLiquidity >= MIN_LIQUIDITY_USD) || !passesMomentum(pair).ok) {
+          stats.cg_dex_rejected++;
+          console.log(`[cg] "${displayName}" — rejected by DexScreener: dex ${describeChanges(pair.priceChange)} | cg ${describeChanges(pool.priceChange)} | dex liquidity $${Math.round(dexLiquidity)}`);
+          continue;
+        }
+        stats.cg_dex_confirmed++;
+        confirmed.push({ pool, pair, displayName, launchMs });
+      }
+    }
+  }
+  cycle.cgConfirmed = confirmed.length;
+
+  let alerted = 0;
+  for (const { pool, pair, displayName, launchMs } of confirmed) {
     const text = buildTokenClassifyText(pool.name, pool.symbol, "");
     const isAnimal = text ? await classifyIsAnimalTrend(text, env) : false;
     const pending = { tokenAddress: pool.address, chain: "solana", description: "", discoveredAt: new Date().toISOString() };
-    const displayName = buildDisplayName(pool.name, pool.symbol, pending);
-    console.log(`[cg] "${displayName}" — liquidity $${Math.round(pool.reserveUsd)}, animal-themed: ${isAnimal}`);
+    const dexLiquidity = pair.liquidity.usd;
+    console.log(`[cg] "${displayName}" — confirmed by DexScreener, liquidity $${Math.round(dexLiquidity)}, animal-themed: ${isAnimal}`);
 
-    const reasons = ["trending (CoinGecko)", "real liquidity"];
+    const reasons = ["trending (CoinGecko)", "confirmed (DexScreener)", "real liquidity"];
     if (isAnimal) reasons.push("animal-themed");
     await recordTokenAlert(env, run, pending, {
       displayName,
       name: pool.name,
       symbol: pool.symbol,
-      url: `https://dexscreener.com/solana/${pool.poolAddress}`,
+      url: `https://dexscreener.com/solana/${pair.pairAddress}`,
       isAnimal,
-      liquidity: pool.reserveUsd,
-      volume24h: Number.isFinite(pool.volume24h) ? pool.volume24h : null,
+      liquidity: dexLiquidity,
+      volume24h: Number.isFinite(pair.volume?.h24) ? pair.volume.h24 : null,
       reasons,
-      pairCreatedAt: pool.createdAtMs,
-      pair: { priceChange: pool.priceChange },
+      pairCreatedAt: launchMs,
+      pair,
       buyers: pool.buyers,
       sellers: pool.sellers
     });
     alerted++;
   }
 
-  stats.cg_passed += passed;
   stats.cg_alerts += alerted;
   stats.alerts += alerted;
-  cycle.cgPools = body.data.length;
-  cycle.cgPassed = passed;
-  console.log(`[cg] ${body.data.length} trending pools, ${passed} passed filters, ${alerted} alerted`);
+  console.log(`[cg] ${body.data.length} trending pools, ${candidates.length} passed CoinGecko, ${confirmed.length} confirmed by DexScreener, ${alerted} alerted`);
 }
 
 async function recordTokenAlert(env, run, pending, fields) {
@@ -1023,7 +1149,8 @@ async function recordTokenAlert(env, run, pending, fields) {
     reasons,
     pair,
     buyers,
-    sellers
+    sellers,
+    ageMs: pairCreatedAt ? now - pairCreatedAt : null
   });
 }
 
@@ -1196,9 +1323,10 @@ function formatUsd(value) {
   return `$${Math.round(value).toLocaleString("en-US")}`;
 }
 
-async function sendTokenAlert(env, { name, chain, url, liquidity, volume24h, reasons, pair, buyers, sellers }) {
+async function sendTokenAlert(env, { name, chain, url, liquidity, volume24h, reasons, pair, buyers, sellers, ageMs }) {
   // Only sources that report buyer/seller counts (CoinGecko) get this line.
   const flowLine = Number.isFinite(buyers) && Number.isFinite(sellers) ? `\n👥 1h: ${buyers} buyers / ${sellers} sellers` : "";
-  const text = `🪙 New token: ${name}\nWhy: ${reasons.join(" + ")}\nChain: ${chain}\nLiquidity: ${formatUsd(liquidity)}\n24h Volume: ${formatUsd(volume24h)}\n📈 ${formatMomentum(pair)}${flowLine}\n${url}`;
+  const ageLine = Number.isFinite(ageMs) ? `\nAge: ${formatAge(ageMs)}` : "";
+  const text = `🪙 New token: ${name}\nWhy: ${reasons.join(" + ")}\nChain: ${chain}${ageLine}\nLiquidity: ${formatUsd(liquidity)}\n24h Volume: ${formatUsd(volume24h)}\n📈 ${formatMomentum(pair)}${flowLine}\n${url}`;
   await sendTelegramMessage(env, text, "discoverTokens");
 }
