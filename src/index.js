@@ -4,7 +4,23 @@ const SCRAPEDO_DAILY_CAP = 30;       // max Scrape.do fallback attempts per UTC 
 const SCRAPINGANT_DAILY_CAP = 300;   // max ScrapingAnt fallback attempts per UTC day (~9,000/month, under the free 10,000)
 const TOKEN_SNAPSHOT_CAP = 2000;     // max token addresses remembered in tokenSnapshot
 const STATS_TTL_SECONDS = 14 * 24 * 60 * 60; // keep daily stats for 14 days
-const CYCLE_LOG_CAP = 250;           // per-day cycle log entries (a full day is 180 cycles)
+const CYCLE_LOG_CAP = 400;           // per-day cycle log entries (a full day is about 360 cycles)
+const MOMENTUM_WINDOWS = ["m5", "h1", "h6"];
+const MAX_MOMENTUM_CHECKS = 8;
+const MIN_LIQUIDITY_USD = 10000;     // minimum liquidity for any token alert, from either source
+const CG_MONTHLY_CAP = 9800;         // max CoinGecko calls per UTC month (free plan allows 10,000)
+const CG_MAX_POOL_AGE_HOURS = 24;    // CoinGecko trending pools older than this are ignored
+const CG_COUNTER_TTL_SECONDS = 40 * 24 * 60 * 60; // monthly call counter outlives its month by about 10 days
+// Counters added after launch; older days' stats don't contain them, so reports default them to 0.
+const LATE_COUNTER_DEFAULTS = {
+  token_momentum_fail: 0,
+  cg_ok: 0,
+  cg_fail: 0,
+  cg_skipped_cap: 0,
+  cg_pools_seen: 0,
+  cg_passed: 0,
+  cg_alerts: 0
+};
 
 export default {
   async fetch(request, env, ctx) {
@@ -29,10 +45,16 @@ export default {
         const raw = await env.TREND_STATE.get(k.name);
         if (!raw) continue;
         const { log, ...counters } = JSON.parse(raw);
-        days[k.name.slice("stats:".length)] = counters;
+        days[k.name.slice("stats:".length)] = { ...LATE_COUNTER_DEFAULTS, ...counters };
       }
+      const cgMonth = new Date().toISOString().slice(0, 7);
       return Response.json(
-        { scrapedoDailyCap: SCRAPEDO_DAILY_CAP, scrapingantDailyCap: SCRAPINGANT_DAILY_CAP, days },
+        {
+          scrapedoDailyCap: SCRAPEDO_DAILY_CAP,
+          scrapingantDailyCap: SCRAPINGANT_DAILY_CAP,
+          coingecko: { month: cgMonth, callsThisMonth: await getCgMonthCount(env, cgMonth), monthlyCap: CG_MONTHLY_CAP },
+          days
+        },
         { headers: { "Cache-Control": "no-store" } }
       );
     }
@@ -43,7 +65,9 @@ export default {
       if (!raw) {
         return Response.json({ day, error: "No data for this day (days are UTC, format YYYY-MM-DD)." }, { status: 404 });
       }
-      return Response.json(buildDayReport(day, JSON.parse(raw)), { headers: { "Cache-Control": "no-store" } });
+      const cgMonth = day.slice(0, 7);
+      const cgUsage = { month: cgMonth, callsThisMonth: await getCgMonthCount(env, cgMonth), monthlyCap: CG_MONTHLY_CAP };
+      return Response.json(buildDayReport(day, JSON.parse(raw), cgUsage), { headers: { "Cache-Control": "no-store" } });
     }
 
     if (url.pathname === "/debug/probe") {
@@ -58,6 +82,14 @@ export default {
         },
       };
       const out = {};
+      if (env.COINGECKO_API_KEY) {
+        targets.coingecko = {
+          url: "https://api.coingecko.com/api/v3/onchain/networks/solana/new_pools",
+          headers: { "x-cg-demo-api-key": env.COINGECKO_API_KEY },
+        };
+      } else {
+        out.coingecko = { skipped: "no key" };
+      }
       for (const [name, t] of Object.entries(targets)) {
         const t0 = Date.now();
         try {
@@ -78,10 +110,12 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    if (event.cron === "*/8 * * * *") {
-      await discover(env);
-      await discoverWire(env);
+    if (event.cron === "*/4 * * * *") {
       await discoverTokens(env);
+      if (new Date(event.scheduledTime).getUTCMinutes() % 8 === 0) {
+        await discover(env);
+        await discoverWire(env);
+      }
     } else if (event.cron === "*/15 * * * *") {
       await confirm(env);
     } else {
@@ -303,6 +337,13 @@ function emptyStats() {
     scrapingant_ok: 0,          // successful ScrapingAnt calls = credits used
     scrapingant_fail: 0,
     scrapingant_skipped_cap: 0, // times the fallback was needed but the daily cap was reached
+    token_momentum_fail: 0,
+    cg_ok: 0,
+    cg_fail: 0,
+    cg_skipped_cap: 0,    // times the CoinGecko call was skipped because the monthly cap was reached
+    cg_pools_seen: 0,
+    cg_passed: 0,
+    cg_alerts: 0,
     alerts: 0
   };
 }
@@ -418,15 +459,16 @@ function summarizeMinutes(values) {
   return { count: v.length, median: at(0.5), p90: at(0.9), max: v[v.length - 1] };
 }
 
-function buildDayReport(day, stats) {
-  const { log = [], ...counters } = stats;
+function buildDayReport(day, stats, cgUsage = null) {
+  const { log = [], ...storedCounters } = stats;
+  const counters = { ...LATE_COUNTER_DEFAULTS, ...storedCounters };
   const times = log.map(c => Date.parse(c.t)).sort((a, b) => a - b);
 
-  // Cron runs every 8 minutes; anything over 12 minutes between logged cycles is a gap.
+  // Token discovery runs every 4 minutes; anything over 9 minutes between logged cycles is a gap.
   const cronGaps = [];
   for (let i = 1; i < times.length; i++) {
     const minutes = (times[i] - times[i - 1]) / 60000;
-    if (minutes > 12) {
+    if (minutes > 9) {
       cronGaps.push({ from: new Date(times[i - 1]).toISOString(), to: new Date(times[i]).toISOString(), minutes: Math.round(minutes) });
     }
   }
@@ -439,7 +481,7 @@ function buildDayReport(day, stats) {
 
   return {
     day,
-    note: "All times are UTC. A full day is 180 cycles (every 8 minutes).",
+    note: "All times are UTC. Token discovery runs every 4 minutes (about 360 cycles per day).",
     firstCycle: times.length ? new Date(times[0]).toISOString() : null,
     lastCycle: times.length ? new Date(times[times.length - 1]).toISOString() : null,
     cyclesLogged: log.length,
@@ -462,6 +504,17 @@ function buildDayReport(day, stats) {
       creditsUsed: counters.scrapingant_ok || 0,
       dailyCap: SCRAPINGANT_DAILY_CAP,
       timesCapBlockedFallback: counters.scrapingant_skipped_cap || 0
+    },
+    coingecko: {
+      month: cgUsage?.month ?? null,
+      callsThisMonth: cgUsage?.callsThisMonth ?? null,
+      monthlyCap: CG_MONTHLY_CAP,
+      ok: counters.cg_ok,
+      failed: counters.cg_fail,
+      timesSkippedForCap: counters.cg_skipped_cap,
+      poolsSeen: counters.cg_pools_seen,
+      passedFilters: counters.cg_passed,
+      alerts: counters.cg_alerts
     },
     alerts: {
       count: alerts.length,
@@ -487,6 +540,13 @@ async function discoverTokens(env) {
   try {
     await ingestTokenProfiles(env, run);
     await evaluatePendingTokens(env, run);
+    // Second source. Fully isolated: nothing it does may break the DexScreener path above or the stats save below.
+    try {
+      await discoverTrendingCG(env, run);
+    } catch (err) {
+      run.stats.cg_fail++;
+      console.error("[cg] Unexpected error:", err);
+    }
   } finally {
     stats.log = [...(stats.log || []), run.cycle].slice(-CYCLE_LOG_CAP);
     await saveStats(env, statsKey, stats);
@@ -499,7 +559,7 @@ async function ingestTokenProfiles(env, run) {
 
   if (!result.success) {
     run.stats.profiles_failed++;
-    console.error("[discoverTokens] Could not fetch token profiles this cycle (direct and Scrape.do both failed or Scrape.do was capped).");
+    console.error("[discoverTokens] Could not fetch token profiles this cycle (direct, Scrape.do, and ScrapingAnt all failed or were capped).");
     return;
   }
   run.stats.profiles_ok++;
@@ -565,6 +625,30 @@ function buildDisplayName(name, symbol, pending) {
   return pending.tokenAddress;
 }
 
+function passesMomentum(pair) {
+  const failed = MOMENTUM_WINDOWS
+    .filter(window => {
+      const value = pair?.priceChange?.[window];
+      return typeof value !== "number" || !Number.isFinite(value) || value <= 0;
+    })
+    .map(window => {
+      const value = pair?.priceChange?.[window];
+      return `${window}=${typeof value === "number" && Number.isFinite(value) ? value : "n/a"}`;
+    });
+  return { ok: failed.length === 0, failed };
+}
+
+function formatMomentum(pair) {
+  const labels = { m5: "5m", h1: "1h", h6: "6h" };
+  return MOMENTUM_WINDOWS.map(window => {
+    const value = pair?.priceChange?.[window];
+    const formatted = typeof value === "number" && Number.isFinite(value)
+      ? `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`
+      : "n/a";
+    return `${labels[window]} ${formatted}`;
+  }).join(" | ");
+}
+
 async function savePending(env, key, pending) {
   await env.TREND_STATE.put(key, JSON.stringify(pending), {
     metadata: { status: "pending", discoveredAt: pending.discoveredAt }
@@ -575,9 +659,8 @@ async function savePending(env, key, pending) {
 async function evaluatePendingTokens(env, run) {
   const TOKEN_CAP = 30;
   const BATCH_SIZE = 30;              // DexScreener accepts up to 30 addresses per tokens/v1 request
-  const MIN_LIQUIDITY_USD = 10000;
   const MAX_AGE_MS = 3 * 60 * 60 * 1000;
-  const MAX_NO_PAIR_CHECKS = 3;       // tokens with no trading pairs yet get a few more chances
+  const MAX_NO_PAIR_CHECKS = 6;       // preserves the existing retry window at a 4-minute cycle
 
   const list = await env.TREND_STATE.list({ prefix: "tokenpending:" });
   const pendingKeys = list.keys.filter(k => k.metadata?.status === "pending");
@@ -622,7 +705,7 @@ async function evaluatePendingTokens(env, run) {
     byChain.get(t.pending.chain).push(t);
   }
 
-  const market = new Map();    // lowercase address -> { liquidity, volume24h, name, symbol }
+  const market = new Map();    // lowercase address -> { liquidity, volume24h, name, symbol, pair }
   const fetchedOk = new Set(); // lowercase addresses whose batch lookup succeeded
 
   for (const [chain, group] of byChain) {
@@ -646,8 +729,10 @@ async function evaluatePendingTokens(env, run) {
           const addr = side.address.toLowerCase();
           if (!asked.has(addr)) continue;
 
-          const entry = market.get(addr) || { liquidity: 0, volume24h: 0, name: null, symbol: null, pairCreatedAt: null };
-          entry.liquidity = Math.max(entry.liquidity, pair.liquidity?.usd || 0);
+          const entry = market.get(addr) || { liquidity: 0, volume24h: 0, name: null, symbol: null, pairCreatedAt: null, pair: null };
+          const pairLiquidity = pair.liquidity?.usd || 0;
+          if (pairLiquidity >= entry.liquidity) entry.pair = pair;
+          entry.liquidity = Math.max(entry.liquidity, pairLiquidity);
           entry.volume24h = Math.max(entry.volume24h, pair.volume?.h24 || 0);
           if (!entry.name && side.name) {
             entry.name = side.name;
@@ -708,6 +793,26 @@ async function evaluatePendingTokens(env, run) {
       continue;
     }
 
+    const momentum = passesMomentum(info.pair);
+    if (!momentum.ok) {
+      pending.momentumChecks = (pending.momentumChecks || 0) + 1;
+      run.stats.token_momentum_fail++;
+      console.log(`[discoverTokens] ${pending.tokenAddress} — momentum failed: ${momentum.failed.join(", ")} (${pending.momentumChecks}/${MAX_MOMENTUM_CHECKS})`);
+      if (pending.momentumChecks >= MAX_MOMENTUM_CHECKS) {
+        await env.TREND_STATE.delete(key);
+      } else {
+        await savePending(env, key, pending);
+      }
+      continue;
+    }
+
+    // Already alerted (e.g. by the CoinGecko source)? Never alert the same token twice.
+    if (await env.TREND_STATE.get(`candidate:TOKEN:${pending.tokenAddress}`)) {
+      console.log(`[discoverTokens] "${displayName}" — already alerted by another source, skipped`);
+      await env.TREND_STATE.delete(key);
+      continue;
+    }
+
     // Only qualifying tokens get classified, so Haiku isn't called on tokens that can't alert anyway.
     const text = buildTokenClassifyText(name, symbol, pending.description);
     const isAnimal = text ? await classifyIsAnimalTrend(text, env) : false;
@@ -717,7 +822,7 @@ async function evaluatePendingTokens(env, run) {
     if (isAnimal) reasons.push("animal-themed");
     await recordTokenAlert(env, run, pending, {
       displayName, name, symbol, url: pending.profileUrl || `https://dexscreener.com/${pending.chain}/${pending.tokenAddress}`,
-      isAnimal, liquidity: info.liquidity, volume24h: info.volume24h, reasons, pairCreatedAt: info.pairCreatedAt
+      isAnimal, liquidity: info.liquidity, volume24h: info.volume24h, reasons, pairCreatedAt: info.pairCreatedAt, pair: info.pair
     });
     alertCount++;
 
@@ -729,8 +834,160 @@ async function evaluatePendingTokens(env, run) {
   console.log(`[discoverTokens] ${alertCount} of ${tokens.length} evaluated tokens triggered an alert`);
 }
 
+// ---- Discovery: CoinGecko trending pools (second token source, Solana) ----
+
+async function getCgMonthCount(env, month) {
+  const raw = await env.TREND_STATE.get(`cg_calls:${month}`);
+  return parseInt(raw, 10) || 0;
+}
+
+// CoinGecko sends numbers as strings and uses null for missing values; Number(null) would be 0, so map those to NaN.
+function toNum(value) {
+  if (value === null || value === undefined || value === "") return NaN;
+  return Number(value);
+}
+
+// Turns a trending_pools response into one entry per base token (its highest-liquidity pool).
+function parseCgPools(body) {
+  const includedTokens = new Map();
+  for (const item of body?.included || []) {
+    if (item?.id) includedTokens.set(item.id, item.attributes || {});
+  }
+
+  const rank = n => (Number.isFinite(n) ? n : -Infinity);
+  const byToken = new Map();
+  for (const pool of body?.data || []) {
+    const attrs = pool?.attributes || {};
+    const baseId = pool?.relationships?.base_token?.data?.id;
+    if (!baseId) continue;
+
+    const address = baseId.replace(/^solana_/, "");
+    const token = includedTokens.get(baseId) || {};
+    const nameFromPool = typeof attrs.name === "string" ? attrs.name.split(" / ")[0].trim() : "";
+    const price = attrs.price_change_percentage || {};
+    const h1Txns = attrs.transactions?.h1 || {};
+
+    const parsed = {
+      address,
+      poolAddress: attrs.address || String(pool.id || "").replace(/^solana_/, ""),
+      name: token.name || nameFromPool || null,
+      symbol: token.symbol || null,
+      reserveUsd: toNum(attrs.reserve_in_usd),
+      createdAtMs: Date.parse(attrs.pool_created_at),
+      priceChange: { m5: toNum(price.m5), h1: toNum(price.h1), h6: toNum(price.h6) },
+      volume24h: toNum(attrs.volume_usd?.h24),
+      buyers: toNum(h1Txns.buyers),
+      sellers: toNum(h1Txns.sellers)
+    };
+
+    const existing = byToken.get(address);
+    if (!existing || rank(parsed.reserveUsd) > rank(existing.reserveUsd)) byToken.set(address, parsed);
+  }
+  return [...byToken.values()];
+}
+
+// Returns why a CoinGecko pool doesn't qualify, or null if it does.
+function cgPoolRejection(pool, now) {
+  const ageMs = now - pool.createdAtMs;
+  if (!Number.isFinite(ageMs) || ageMs > CG_MAX_POOL_AGE_HOURS * 60 * 60 * 1000) return "pool too old or undated";
+  if (!(pool.reserveUsd >= MIN_LIQUIDITY_USD)) return "liquidity below minimum";
+  const momentum = passesMomentum({ priceChange: pool.priceChange });
+  if (!momentum.ok) return `momentum failed: ${momentum.failed.join(", ")}`;
+  return null;
+}
+
+async function discoverTrendingCG(env, run) {
+  const { stats, cycle } = run;
+
+  if (!env.COINGECKO_API_KEY) {
+    stats.cg_fail++;
+    cycle.cg = "no_key";
+    console.log("[cg] COINGECKO_API_KEY is not set — skipping CoinGecko trending");
+    return;
+  }
+
+  // Monthly safety cap. The counter is bumped before the request, so every attempt counts.
+  const month = new Date().toISOString().slice(0, 7);
+  try {
+    const used = await getCgMonthCount(env, month);
+    if (used >= CG_MONTHLY_CAP) {
+      stats.cg_skipped_cap++;
+      cycle.cg = "skipped_cap";
+      console.log(`[cg] Monthly cap reached (${used}/${CG_MONTHLY_CAP}) — skipping CoinGecko for the rest of ${month}`);
+      return;
+    }
+    await env.TREND_STATE.put(`cg_calls:${month}`, String(used + 1), { expirationTtl: CG_COUNTER_TTL_SECONDS });
+  } catch (err) {
+    // Without a reliable counter the cap can't be enforced, so don't call.
+    stats.cg_fail++;
+    cycle.cg = "fail";
+    console.error("[cg] Could not read/update the monthly call counter — skipping:", err.message || err);
+    return;
+  }
+
+  let body;
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/onchain/networks/solana/trending_pools?duration=5m&include=base_token", {
+      headers: { accept: "application/json", "x-cg-demo-api-key": env.COINGECKO_API_KEY },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (res.status !== 200) throw new Error(`status ${res.status}`);
+    body = JSON.parse(await res.text());
+    if (!Array.isArray(body?.data)) throw new Error("response has no data array");
+  } catch (err) {
+    stats.cg_fail++;
+    cycle.cg = "fail";
+    console.error(`[cg] CoinGecko trending request failed: ${err.message || err}`);
+    return;
+  }
+
+  stats.cg_ok++;
+  cycle.cg = "ok";
+  stats.cg_pools_seen += body.data.length;
+
+  const now = Date.now();
+  let passed = 0;
+  let alerted = 0;
+  for (const pool of parseCgPools(body)) {
+    if (cgPoolRejection(pool, now)) continue;
+    if (await env.TREND_STATE.get(`candidate:TOKEN:${pool.address}`)) continue; // already alerted
+    passed++;
+
+    const text = buildTokenClassifyText(pool.name, pool.symbol, "");
+    const isAnimal = text ? await classifyIsAnimalTrend(text, env) : false;
+    const pending = { tokenAddress: pool.address, chain: "solana", description: "", discoveredAt: new Date().toISOString() };
+    const displayName = buildDisplayName(pool.name, pool.symbol, pending);
+    console.log(`[cg] "${displayName}" — liquidity $${Math.round(pool.reserveUsd)}, animal-themed: ${isAnimal}`);
+
+    const reasons = ["trending (CoinGecko)", "real liquidity"];
+    if (isAnimal) reasons.push("animal-themed");
+    await recordTokenAlert(env, run, pending, {
+      displayName,
+      name: pool.name,
+      symbol: pool.symbol,
+      url: `https://dexscreener.com/solana/${pool.poolAddress}`,
+      isAnimal,
+      liquidity: pool.reserveUsd,
+      volume24h: Number.isFinite(pool.volume24h) ? pool.volume24h : null,
+      reasons,
+      pairCreatedAt: pool.createdAtMs,
+      pair: { priceChange: pool.priceChange },
+      buyers: pool.buyers,
+      sellers: pool.sellers
+    });
+    alerted++;
+  }
+
+  stats.cg_passed += passed;
+  stats.cg_alerts += alerted;
+  stats.alerts += alerted;
+  cycle.cgPools = body.data.length;
+  cycle.cgPassed = passed;
+  console.log(`[cg] ${body.data.length} trending pools, ${passed} passed filters, ${alerted} alerted`);
+}
+
 async function recordTokenAlert(env, run, pending, fields) {
-  const { displayName, name, symbol, url, isAnimal, liquidity, volume24h, reasons, pairCreatedAt = null } = fields;
+  const { displayName, name, symbol, url, isAnimal, liquidity, volume24h, reasons, pairCreatedAt = null, pair, buyers = null, sellers = null } = fields;
   const now = Date.now();
   const round1 = n => Math.round(n * 10) / 10;
   const queueToAlertMin = round1((now - new Date(pending.discoveredAt).getTime()) / 60000);
@@ -763,7 +1020,10 @@ async function recordTokenAlert(env, run, pending, fields) {
     url,
     liquidity,
     volume24h,
-    reasons
+    reasons,
+    pair,
+    buyers,
+    sellers
   });
 }
 
@@ -936,7 +1196,9 @@ function formatUsd(value) {
   return `$${Math.round(value).toLocaleString("en-US")}`;
 }
 
-async function sendTokenAlert(env, { name, chain, url, liquidity, volume24h, reasons }) {
-  const text = `🪙 New token: ${name}\nWhy: ${reasons.join(" + ")}\nChain: ${chain}\nLiquidity: ${formatUsd(liquidity)}\n24h Volume: ${formatUsd(volume24h)}\n${url}`;
+async function sendTokenAlert(env, { name, chain, url, liquidity, volume24h, reasons, pair, buyers, sellers }) {
+  // Only sources that report buyer/seller counts (CoinGecko) get this line.
+  const flowLine = Number.isFinite(buyers) && Number.isFinite(sellers) ? `\n👥 1h: ${buyers} buyers / ${sellers} sellers` : "";
+  const text = `🪙 New token: ${name}\nWhy: ${reasons.join(" + ")}\nChain: ${chain}\nLiquidity: ${formatUsd(liquidity)}\n24h Volume: ${formatUsd(volume24h)}\n📈 ${formatMomentum(pair)}${flowLine}\n${url}`;
   await sendTelegramMessage(env, text, "discoverTokens");
 }
